@@ -33,26 +33,55 @@ public abstract class PostgresTestBase {
 
     protected static final HikariDataSource DATA_SOURCE;
 
+    /**
+     * Point the suite at an existing Postgres instead of starting a container.
+     *
+     * <p><strong>Every test truncates {@code jobs}.</strong> Only ever set this to a throwaway
+     * database. The environment variable is the opt-in, and the database name is logged on startup
+     * so a mistake is loud rather than silent.
+     */
+    private static final String EXTERNAL_URL_ENV = "PENDULUM_TEST_JDBC_URL";
+
     static {
-        PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
-                DockerImageName.parse("postgres:16-alpine"))
-                .withDatabaseName("pendulum")
-                .withUsername("pendulum")
-                .withPassword("pendulum")
-                // Faster than the default for a throwaway container; the engine's durability story
-                // is about crashed workers, not crashed databases, so fsync buys the suite nothing.
-                .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=200");
-        postgres.start();
+        String externalUrl = System.getenv(EXTERNAL_URL_ENV);
 
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl(postgres.getJdbcUrl());
-        config.setUsername(postgres.getUsername());
-        config.setPassword(postgres.getPassword());
+        if (externalUrl != null && !externalUrl.isBlank()) {
+            // Useful where Docker is unavailable, and useful on purpose: running the same suite
+            // against a real managed Postgres is how you find out that your RDS parameter group
+            // disagrees with your laptop.
+            config.setJdbcUrl(externalUrl);
+            config.setUsername(System.getenv("PENDULUM_TEST_DB_USER"));
+            config.setPassword(System.getenv("PENDULUM_TEST_DB_PASSWORD"));
+            System.out.println("[pendulum-test] using external database " + redact(externalUrl)
+                    + " — every test TRUNCATEs the jobs table in it");
+        } else {
+            PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
+                    DockerImageName.parse("postgres:16-alpine"))
+                    .withDatabaseName("pendulum")
+                    .withUsername("pendulum")
+                    .withPassword("pendulum")
+                    // Faster than the default for a throwaway container; the engine's durability
+                    // story is about crashed workers, not crashed databases, so fsync buys the
+                    // suite nothing.
+                    .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=200");
+            postgres.start();
+            config.setJdbcUrl(postgres.getJdbcUrl());
+            config.setUsername(postgres.getUsername());
+            config.setPassword(postgres.getPassword());
+        }
+
         config.setMaximumPoolSize(32);
         config.setPoolName("pendulum-test");
         DATA_SOURCE = new HikariDataSource(config);
 
         Pendulum.migrate(DATA_SOURCE);
+    }
+
+    /** Log the host and database, never anything that could carry a credential. */
+    private static String redact(String jdbcUrl) {
+        int query = jdbcUrl.indexOf('?');
+        return query < 0 ? jdbcUrl : jdbcUrl.substring(0, query);
     }
 
     protected final JobStore store = new PostgresJobStore(DATA_SOURCE);

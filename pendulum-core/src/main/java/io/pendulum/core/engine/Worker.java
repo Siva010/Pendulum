@@ -232,6 +232,7 @@ public final class Worker implements AutoCloseable {
             }
             handleFailure(execution, t);
         } finally {
+            execution.finished = true;
             inFlight.remove(job.id());
             capacity.release();
         }
@@ -284,11 +285,19 @@ public final class Worker implements AutoCloseable {
      */
     private void renewLeases() {
         for (Execution execution : inFlight.values()) {
-            if (!execution.started || !execution.leaseHeld.get()) {
+            if (!execution.started || execution.finished || !execution.leaseHeld.get()) {
                 continue;
             }
             try {
                 if (!store.heartbeat(execution.job.id(), execution.token, config.leaseDuration())) {
+                    // Re-check before believing it. A job that completed while this beat was in
+                    // flight has already left LEASED/RUNNING, so the fence rejects the heartbeat
+                    // for an entirely benign reason. Treating that as lease loss would inflate the
+                    // one metric that is supposed to mean "leases are expiring under live work"
+                    // and interrupt a thread that is already done.
+                    if (execution.finished) {
+                        continue;
+                    }
                     execution.leaseHeld.set(false);
                     metrics.recordLeaseLost();
                     log.warn("lost lease for in-flight job {} ({}); interrupting handler",
@@ -327,13 +336,18 @@ public final class Worker implements AutoCloseable {
             return;
         }
         log.info("worker {} draining (timeout={})", config.workerId(), config.drainTimeout());
+        // One deadline for the whole drain, not one per phase. Waiting for the poll loop and then
+        // waiting again for in-flight work could take two full drain timeouts, which is how a pod
+        // overruns terminationGracePeriodSeconds and gets SIGKILLed mid-drain — the exact outcome
+        // the drain exists to avoid.
+        long deadline = System.nanoTime() + config.drainTimeout().toNanos();
+
         Thread poller = pollThread;
         if (poller != null) {
             poller.interrupt();
         }
-        awaitQuietly(stopped, config.drainTimeout());
+        awaitQuietly(stopped, remaining(deadline));
 
-        long deadline = System.nanoTime() + config.drainTimeout().toNanos();
         while (!inFlight.isEmpty() && System.nanoTime() < deadline) {
             sleep(25);
         }
@@ -383,6 +397,9 @@ public final class Worker implements AutoCloseable {
         private final LeaseToken token;
         private final AtomicBoolean leaseHeld = new AtomicBoolean(true);
         private volatile boolean started;
+        /** Set before the job leaves {@code inFlight}, so a racing heartbeat can tell "this
+         *  completed" from "someone took this away from us". */
+        private volatile boolean finished;
         private volatile Thread runner;
 
         private Execution(Job job, LeaseToken token) {
@@ -420,10 +437,14 @@ public final class Worker implements AutoCloseable {
 
     private static void awaitQuietly(CountDownLatch latch, Duration timeout) {
         try {
-            latch.await(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            latch.await(Math.max(0, timeout.toMillis()), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static Duration remaining(long deadlineNanos) {
+        return Duration.ofNanos(Math.max(0, deadlineNanos - System.nanoTime()));
     }
 
     private static final class UnknownJobTypeException extends RuntimeException {

@@ -9,6 +9,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -63,17 +64,41 @@ class LeaseDispatchIT extends PostgresTestBase {
         assertThat(untilDue).isBetween(Duration.ofMinutes(9), Duration.ofMinutes(11));
     }
 
+    /**
+     * Asserted as <em>selection</em>, not as the order of the returned rows.
+     *
+     * <p>Postgres computes RETURNING per row actually updated and promises nothing about the order
+     * it hands them back — the subquery's ORDER BY governs which rows the LIMIT picks, not the
+     * sequence they come out of the join in. A test that asserted the returned order would pass
+     * today on a nested loop and start failing the day the planner changed its mind, which is the
+     * worst kind of test. Claiming fewer jobs than exist is what actually exercises the ordering.
+     */
     @Test
-    @DisplayName("higher priority first, then oldest run_at")
+    @DisplayName("priority decides which jobs a short claim wins")
     void claim_respects_priority_then_age() {
         UUID low = enqueue(NewJob.of("tenant-a", "batch").priority(0).build());
         UUID high = enqueue(NewJob.of("tenant-a", "urgent").priority(10).build());
         UUID medium = enqueue(NewJob.of("tenant-a", "normal").priority(5).build());
 
-        List<UUID> order = store.claim(NewJob.DEFAULT_QUEUE, "worker-a", 10, LEASE)
+        List<UUID> claimed = store.claim(NewJob.DEFAULT_QUEUE, "worker-a", 2, LEASE)
                 .stream().map(Job::id).toList();
 
-        assertThat(order).containsExactly(high, medium, low);
+        assertThat(claimed).containsExactlyInAnyOrder(high, medium);
+        assertThat(stateOf(low)).as("the lowest priority is left behind").isEqualTo("PENDING");
+    }
+
+    @Test
+    @DisplayName("among equal priorities the oldest run_at wins")
+    void claim_prefers_the_oldest_when_priorities_tie() {
+        Instant now = store.databaseNow();
+        UUID newer = enqueue(NewJob.of("tenant-a", "batch").runAt(now.minusSeconds(10)).build());
+        UUID older = enqueue(NewJob.of("tenant-a", "batch").runAt(now.minusSeconds(600)).build());
+
+        List<UUID> claimed = store.claim(NewJob.DEFAULT_QUEUE, "worker-a", 1, LEASE)
+                .stream().map(Job::id).toList();
+
+        assertThat(claimed).containsExactly(older);
+        assertThat(stateOf(newer)).isEqualTo("PENDING");
     }
 
     @Test
@@ -99,18 +124,21 @@ class LeaseDispatchIT extends PostgresTestBase {
     }
 
     @Test
-    @DisplayName("every claim issues a strictly greater fencing token")
+    @DisplayName("every claim issues a distinct, strictly greater fencing token")
     void tokens_are_monotonic() {
+        enqueue("first");
+        long baseline = store.claim(NewJob.DEFAULT_QUEUE, "worker-a", 1, LEASE)
+                .getFirst().leaseToken().map(LeaseToken::value).orElseThrow();
+
         enqueue("a");
         enqueue("b");
-
-        List<Job> claimed = store.claim(NewJob.DEFAULT_QUEUE, "worker-a", 2, LEASE);
-        List<Long> tokens = claimed.stream()
+        List<Long> tokens = store.claim(NewJob.DEFAULT_QUEUE, "worker-a", 2, LEASE).stream()
                 .map(job -> job.leaseToken().map(LeaseToken::value).orElseThrow())
                 .toList();
 
-        assertThat(tokens).isSorted();
-        assertThat(tokens.getFirst()).isLessThan(tokens.getLast());
+        // Monotonicity is a property of the sequence, not of the order RETURNING happens to use.
+        assertThat(tokens).doesNotHaveDuplicates().hasSize(2);
+        assertThat(tokens).allSatisfy(token -> assertThat(token).isGreaterThan(baseline));
     }
 
     /**

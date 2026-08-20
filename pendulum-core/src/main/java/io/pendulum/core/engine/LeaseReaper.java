@@ -29,6 +29,9 @@ public final class LeaseReaper implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(LeaseReaper.class);
 
+    /** Ceiling on batches drained per tick, so one pass cannot run forever. */
+    private static final int MAX_PASSES_PER_TICK = 50;
+
     private final JobStore store;
     private final Duration interval;
     private final int batchSize;
@@ -73,10 +76,19 @@ public final class LeaseReaper implements AutoCloseable {
         int total = 0;
         try {
             int batch;
+            int passes = 0;
             do {
                 batch = store.reapExpiredLeases(batchSize);
                 total += batch;
-            } while (batch == batchSize);
+                // Bounded, because "drain until a short batch" is unbounded when leases expire as
+                // fast as they are reclaimed — a fleet-wide stall would pin this thread in the loop
+                // forever and starve the schedule. Whatever is left waits for the next tick.
+            } while (batch == batchSize && ++passes < MAX_PASSES_PER_TICK);
+
+            if (passes >= MAX_PASSES_PER_TICK) {
+                log.warn("reap pass hit its {}-batch ceiling with work still expired; "
+                        + "leases are expiring faster than they are being reclaimed", MAX_PASSES_PER_TICK);
+            }
 
             if (total > 0) {
                 reclaimed.add(total);
