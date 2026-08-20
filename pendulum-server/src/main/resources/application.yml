@@ -1,0 +1,62 @@
+spring:
+  application:
+    name: pendulum
+
+  datasource:
+    url: ${PENDULUM_DB_URL:jdbc:postgresql://localhost:5432/pendulum}
+    username: ${PENDULUM_DB_USER:pendulum}
+    password: ${PENDULUM_DB_PASSWORD:pendulum}
+    hikari:
+      pool-name: pendulum
+      # Rule of thumb: connections ~= cores * 2 + effective spindles. The temptation is to raise
+      # this when the queue backs up, which usually makes things worse — a pool larger than the
+      # database can serve just moves the queueing from your app into Postgres, where it costs
+      # more. The dispatch statement is short; the pool should be too.
+      maximum-pool-size: ${PENDULUM_DB_POOL_SIZE:16}
+      minimum-idle: 4
+      connection-timeout: 5000
+      # Shorter than any sane lease, so a connection wedged on a dead network cannot silently
+      # hold a job past its lease expiry.
+      validation-timeout: 2000
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Matches io.pendulum.core.Pendulum#migrate, so an embedded engine and this server share one
+    # migration history rather than fighting over two.
+    table: pendulum_schema_history
+
+pendulum:
+  queue: ${PENDULUM_QUEUE:default}
+  workers: ${PENDULUM_WORKERS:1}
+  batch-size: 16
+  max-concurrency: 64
+  # Also the worst-case recovery time after a SIGKILL: nothing else picks the job up until this
+  # elapses without a heartbeat.
+  lease-duration: 30s
+  heartbeat-interval: 5s
+  min-poll-interval: 50ms
+  max-poll-interval: 2s
+  # Must fit inside the pod's terminationGracePeriodSeconds, or Kubernetes SIGKILLs the drain.
+  drain-timeout: 20s
+  reap-interval: 1s
+  reap-batch-size: 200
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+server:
+  shutdown: graceful
+
+logging:
+  level:
+    io.pendulum: INFO
