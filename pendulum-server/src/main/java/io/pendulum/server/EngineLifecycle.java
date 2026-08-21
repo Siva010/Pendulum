@@ -1,6 +1,7 @@
 package io.pendulum.server;
 
 import io.pendulum.core.engine.LeaseReaper;
+import io.pendulum.core.outbox.OutboxRelay;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
@@ -24,16 +25,19 @@ public class EngineLifecycle implements SmartLifecycle {
 
     private final WorkerPool pool;
     private final LeaseReaper reaper;
+    private final OutboxRelay outboxRelay;
     private volatile boolean running;
 
-    public EngineLifecycle(WorkerPool pool, LeaseReaper reaper) {
+    public EngineLifecycle(WorkerPool pool, LeaseReaper reaper, OutboxRelay outboxRelay) {
         this.pool = pool;
         this.reaper = reaper;
+        this.outboxRelay = outboxRelay;
     }
 
     @Override
     public void start() {
         reaper.start();
+        outboxRelay.start();
         pool.start();
         running = true;
         log.info("Pendulum engine started with {} worker(s)", pool.size());
@@ -47,6 +51,7 @@ public class EngineLifecycle implements SmartLifecycle {
         running = false;
         log.info("draining Pendulum engine");
         pool.close();
+        outboxRelay.close();
         reaper.close();
         log.info("Pendulum engine stopped: {}", pool.aggregateMetrics());
     }

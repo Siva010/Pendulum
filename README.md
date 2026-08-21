@@ -199,6 +199,74 @@ integration test runs against a real Postgres 16 in Testcontainers.
 
 ---
 
+## Transactional enqueue, and when you need an outbox
+
+The bug this removes:
+
+```java
+orderRepository.save(order);   // committed
+queue.publish(sendEmailJob);   // process dies here — order exists, email never sent, silently
+```
+
+Reverse the two and a rolled-back transaction leaves a job for an order that never existed. **No
+ordering of two independent systems fixes this.** Only one transaction does:
+
+```java
+@Transactional
+public void placeOrder(Order order) {
+    orderRepository.save(order);
+    enqueuer.enqueue(NewJob.of(order.tenantId(), "send-confirmation")
+            .idempotencyKey("confirm:" + order.id())
+            .build());
+}
+```
+
+The order and the job commit together or not at all. This is available precisely because the queue
+lives in the same database as the business data — the entire argument for Postgres over a dedicated
+broker. Kafka cannot join your transaction; that is not a bug in Kafka, it is the tradeoff.
+
+### The part most implementations get wrong
+
+**If your destination is Pendulum and your business data is in the same Postgres, you do not need
+an outbox table.** Inserting into `jobs` inside the caller's transaction *is* the outbox pattern —
+`jobs` is the outbox. Adding a second table and a relay to move rows from one table to another in
+the same database buys nothing and costs a hop, a background thread, and extra latency.
+
+The `outbox` table earns its keep for effects that **cannot** join a transaction:
+
+- producing to Kafka
+- calling a webhook
+- handing a charge to a payment provider
+
+There is no distributed transaction spanning Postgres and Kafka, so the durable record of intent
+commits with the business write, and `OutboxRelay` makes the external call afterwards.
+
+```java
+@Transactional
+public void placeOrder(Order order) {
+    orderRepository.save(order);
+    enqueuer.record(OutboxMessage.to(order.tenantId(), "orders.created")
+            .payload(JsonPayloads.toJson(order))
+            .messageKey("order-" + order.id())   // the consumer's dedup key
+            .build());
+}
+```
+
+### How the relay drains it
+
+`next_attempt_at` doubles as the visibility timeout — no separate lease column, because a row
+invisible until some future instant is exactly a row someone else is working on. The relay claims
+with `SKIP LOCKED`, publishes with **nothing held**, then records the outcome.
+
+The tempting alternative — hold `SELECT ... FOR UPDATE` open, publish, commit — is wrong twice: it
+pins a connection and an MVCC snapshot across a network call to a system you do not control, and it
+still does not give exactly-once, because a crash between publish and commit republishes anyway.
+
+So delivery is **at-least-once**, which is why every message carries a `messageKey` for the consumer
+to deduplicate on. Same honesty as the job engine: the guarantee is stated, not oversold.
+
+---
+
 ## Measured
 
 Run them yourself with `./mvnw verify -Pbenchmarks`. Excluded from CI on purpose — a number

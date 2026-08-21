@@ -172,6 +172,26 @@ public final class PostgresJobStore implements JobStore {
 
     @Override
     public EnqueueResult enqueue(NewJob job) {
+        try (Connection connection = dataSource.getConnection()) {
+            return enqueue(connection, job);
+        } catch (SQLException e) {
+            throw new JobStoreException("failed to enqueue job " + job.id(), e);
+        }
+    }
+
+    /**
+     * Enqueue on a connection the caller owns, so the INSERT joins the caller's transaction.
+     *
+     * <p>This is the whole transactional-enqueue story when the business data lives in this same
+     * database: the job becomes visible if and only if the business write commits. No outbox table,
+     * no relay, no window in which an order exists but its confirmation email does not.
+     *
+     * <p>The connection is deliberately neither committed nor closed here. It belongs to the
+     * caller's unit of work, and a store that quietly committed someone else's transaction would be
+     * far worse than one that does nothing.
+     */
+    @Override
+    public EnqueueResult enqueue(Connection connection, NewJob job) {
         String runAtExpression = switch (job.schedule()) {
             case Schedule.Now n   -> "now()";
             case Schedule.After a -> "now() + make_interval(secs => CAST(? AS double precision))";
@@ -186,8 +206,7 @@ public final class PostgresJobStore implements JobStore {
                 RETURNING id
                 """.formatted(runAtExpression);
 
-        try (Connection connection = dataSource.getConnection();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
 
             int index = 1;
             statement.setObject(index++, job.id());

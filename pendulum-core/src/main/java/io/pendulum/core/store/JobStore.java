@@ -27,6 +27,29 @@ public interface JobStore {
     EnqueueResult enqueue(NewJob job);
 
     /**
+     * Enqueue inside a transaction the caller already owns.
+     *
+     * <p>The single most valuable operation in the engine, and the reason Postgres was chosen over
+     * a dedicated queue. The naive alternatives both lose:
+     *
+     * <pre>{@code
+     * // Enqueue after commit: process dies in the gap. Order created, email never sent, silently.
+     * orderRepository.save(order);   // committed
+     * queue.publish(sendEmailJob);   // <- crash here and the job simply never existed
+     *
+     * // Enqueue before commit: the transaction rolls back and you have a phantom job for an
+     * // order that does not exist.
+     * }</pre>
+     *
+     * With one connection and one transaction, the job and the business write commit or roll back
+     * together, and neither outcome is possible. Kafka cannot do this — it cannot join your
+     * database transaction — which is exactly the tradeoff the README documents.
+     *
+     * <p>The implementation must not commit, roll back, or close the connection.
+     */
+    EnqueueResult enqueue(java.sql.Connection connection, NewJob job);
+
+    /**
      * Atomically claim up to {@code limit} eligible jobs, each with a fresh fencing token.
      *
      * <p>One statement, not select-then-update: two workers running

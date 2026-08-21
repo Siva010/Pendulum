@@ -1,6 +1,10 @@
 package io.pendulum.server;
 
 import io.pendulum.core.engine.HandlerRegistry;
+import io.pendulum.core.outbox.OutboxPublisher;
+import io.pendulum.core.outbox.OutboxRelay;
+import io.pendulum.core.outbox.OutboxStore;
+import io.pendulum.core.outbox.PostgresOutboxStore;
 import io.pendulum.core.engine.LeaseReaper;
 import io.pendulum.core.engine.Worker;
 import io.pendulum.core.engine.WorkerConfig;
@@ -8,7 +12,10 @@ import io.pendulum.core.retry.RetryPolicy;
 import io.pendulum.core.retry.TerminalJobException;
 import io.pendulum.core.store.JobStore;
 import io.pendulum.core.store.PostgresJobStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -88,6 +95,33 @@ public class PendulumConfiguration {
     @Bean
     public LeaseReaper leaseReaper(JobStore store, PendulumProperties properties) {
         return new LeaseReaper(store, properties.reapInterval(), properties.reapBatchSize());
+    }
+
+    @Bean
+    public OutboxStore outboxStore(DataSource dataSource) {
+        return new PostgresOutboxStore(dataSource);
+    }
+
+    /**
+     * Replace this with the adapter for wherever your effects actually go — a Kafka producer, an
+     * HTTP client, an SES client. It logs by default so a fresh clone demonstrates the flow without
+     * requiring a broker, and so that forgetting to replace it is visible rather than silent.
+     *
+     * <p>Whatever you write here, propagate {@code messageKey} onto the outgoing message. Delivery
+     * is at-least-once, and that key is how the consumer makes a replay harmless.
+     */
+    @Bean
+    @ConditionalOnMissingBean(OutboxPublisher.class)
+    public OutboxPublisher loggingOutboxPublisher() {
+        Logger publisherLog = LoggerFactory.getLogger("io.pendulum.outbox.publisher");
+        return message -> publisherLog.info(
+                "PUBLISH destination={} key={} headers={} payload={}",
+                message.destination(), message.messageKey(), message.headers(), message.payload());
+    }
+
+    @Bean
+    public OutboxRelay outboxRelay(OutboxStore outboxStore, OutboxPublisher publisher) {
+        return OutboxRelay.defaults(outboxStore, publisher);
     }
 
 }

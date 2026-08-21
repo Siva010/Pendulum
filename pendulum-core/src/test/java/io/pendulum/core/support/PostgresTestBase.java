@@ -88,7 +88,7 @@ public abstract class PostgresTestBase {
 
     @BeforeEach
     void resetSchema() {
-        execute("TRUNCATE TABLE jobs");
+        execute("TRUNCATE TABLE jobs, outbox");
     }
 
     // ------------------------------------------------------------- test helpers
