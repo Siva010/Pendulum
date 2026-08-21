@@ -511,6 +511,60 @@ price of losing that distinction in the admin view. Worth doing behind a flag.
 
 ---
 
+## Running it in a container
+
+```bash
+docker compose --profile app up -d --build
+```
+
+That brings up Postgres and the server together; without `--profile app` you get Postgres alone,
+which is what the test suite and a locally-run server both want.
+
+The image is multi-stage (JDK to build, JRE to run), runs as a non-root user, and sizes the heap
+with `MaxRAMPercentage` rather than a fixed `-Xmx` so it follows whatever the orchestrator grants.
+`stop_grace_period` is 40s against a 20s drain timeout — **the grace period must exceed the drain**,
+or the process is killed mid-drain and every job it was holding waits out its full lease before
+another worker can touch it. That is the same constraint as `terminationGracePeriodSeconds` on a
+Kubernetes pod, and getting it backwards turns a rolling deploy into a latency spike.
+
+Metrics are at `/actuator/prometheus`. The one worth alerting on is **`pendulum_writes_fenced_total`**:
+a worker producing a result for a job it no longer owns. Harmless in itself — the database rejects
+the write — but non-zero in steady state means leases are expiring under live work, and it is the
+only signal that says so before anyone notices duplicated effects. Scale workers on
+`pendulum_queue_depth`, never on CPU: a worker blocked on a slow vendor API is idle by CPU and
+badly behind by backlog.
+
+---
+
+## Known limitations
+
+Stated here rather than discovered by a reader, because the gaps are deliberate scope decisions and
+one of them would matter immediately in production.
+
+**The admin API is unauthenticated.** There is no Spring Security, no JWT, no tenant check on the
+way in. Anyone who can reach port 8080 can read every job payload, replay dead letters and cancel
+work. Bind it to localhost or put it behind your own gateway; do not expose it. `tenant_id` is a
+column the caller supplies, so it partitions data but does not defend it — real isolation belongs
+at the repository layer, enforced from an authenticated principal rather than a request field.
+
+**One tenant can starve another.** Dispatch orders by `priority DESC, run_at, id` with no tenant
+term, so a tenant enqueuing 100k jobs occupies the head of the queue and a tenant enqueuing five
+afterwards waits behind all of them. The workaround that exists today is a queue per tenant with
+workers assigned per queue, which works until you have thousands of tenants. The real fix is
+weighted round-robin — a lateral join that takes a bounded slice per tenant per poll — and it is
+not built.
+
+**No distributed rate limiting.** "At most 5 concurrent calls to vendor X across the fleet" is not
+expressible; per-queue concurrency caps approximate it within a process only.
+
+**Workflows hold a worker for the whole run.** Fine for seconds, wrong for a workflow that waits
+days on a human. The schema supports continuations; the executor does not implement them.
+
+**Throughput is measured on Docker Desktop for Windows**, whose network layer is materially slower
+than a native Linux socket. Treat 1,646 jobs/sec as a floor, not a ceiling.
+
+---
+
 ## Test suite
 
 | Suite | What it pins down |

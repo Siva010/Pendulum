@@ -33,5 +33,29 @@ services:
       timeout: 3s
       retries: 10
 
+  # `docker compose up -d` brings up Postgres alone, which is what the test suite and a locally
+  # run server both want. The app is behind a profile so it is opt-in:
+  #     docker compose --profile app up -d --build
+  pendulum:
+    build: .
+    container_name: pendulum-server
+    profiles: ["app"]
+    environment:
+      # Inside the compose network Postgres is reachable by service name on its own port, not the
+      # 5433 published to the host.
+      PENDULUM_DB_URL: jdbc:postgresql://postgres:5432/pendulum
+      PENDULUM_DB_USER: pendulum
+      PENDULUM_DB_PASSWORD: pendulum
+      PENDULUM_WORKERS: "2"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Must exceed pendulum.drain-timeout (20s) or the drain is cut short and in-flight jobs wait
+    # out their full lease instead of being handed back.
+    stop_grace_period: 40s
+    restart: unless-stopped
+
 volumes:
   pendulum-pgdata:

@@ -1,0 +1,11 @@
+target/
+**/target/
+.git/
+.github/
+.idea/
+*.iml
+*.log
+verify-output.log
+.env
+.env.test
+README.md

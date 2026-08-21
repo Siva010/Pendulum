@@ -42,6 +42,11 @@ jobs:
         # makes the same command work identically on a laptop.
         run: ./mvnw -B -ntp verify
 
+      - name: Build the container image
+        # Builds on the runner rather than being taken on trust. A Dockerfile that is never built
+        # in CI is a Dockerfile that is broken the first time someone needs it.
+        run: docker build -t pendulum:ci .
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
