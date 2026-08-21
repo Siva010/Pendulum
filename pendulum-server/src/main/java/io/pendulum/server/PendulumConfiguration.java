@@ -15,6 +15,11 @@ import io.pendulum.core.retry.RetryPolicy;
 import io.pendulum.core.retry.TerminalJobException;
 import io.pendulum.core.store.JobStore;
 import io.pendulum.core.store.PostgresJobStore;
+import io.pendulum.core.workflow.PostgresWorkflowStore;
+import io.pendulum.core.workflow.Workflow;
+import io.pendulum.core.workflow.WorkflowEngine;
+import io.pendulum.core.workflow.WorkflowRegistry;
+import io.pendulum.core.workflow.WorkflowStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -98,6 +103,48 @@ public class PendulumConfiguration {
     @Bean
     public LeaseReaper leaseReaper(JobStore store, PendulumProperties properties) {
         return new LeaseReaper(store, properties.reapInterval(), properties.reapBatchSize());
+    }
+
+    @Bean
+    public WorkflowStore workflowStore(DataSource dataSource) {
+        return new PostgresWorkflowStore(dataSource);
+    }
+
+    /**
+     * A demo workflow so a fresh clone has something to run. Each step returns JSON that the next
+     * one reads — the point being that after a crash those values come back from the database
+     * rather than being recomputed.
+     */
+    @Bean
+    public WorkflowRegistry workflowRegistry() {
+        WorkflowRegistry registry = new WorkflowRegistry();
+
+        registry.register(Workflow.named("place-order")
+                .step("reserve-stock", context ->
+                        "{\"reservationId\":\"r-" + System.nanoTime() + "\"}")
+                .step("charge-card", context -> {
+                    Thread.sleep(300);
+                    return "{\"chargeId\":\"c-" + System.nanoTime() + "\"}";
+                })
+                .step("ship", context ->
+                        "{\"tracking\":\"t-" + context.requireOutputOf("charge-card").hashCode() + "\"}")
+                .step("notify", context -> "{\"notified\":true}")
+                .build());
+
+        return registry;
+    }
+
+    /**
+     * Registering the driver handler here is what makes {@code pendulum.workflow} jobs executable.
+     * The engine is otherwise just a writer of rows.
+     */
+    @Bean
+    public WorkflowEngine workflowEngine(WorkflowStore workflowStore, JobStore store,
+                                         WorkflowRegistry workflowRegistry, DataSource dataSource,
+                                         HandlerRegistry handlerRegistry) {
+        WorkflowEngine engine = new WorkflowEngine(workflowStore, store, workflowRegistry, dataSource);
+        engine.registerWith(handlerRegistry);
+        return engine;
     }
 
     @Bean

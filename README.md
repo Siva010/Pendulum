@@ -276,6 +276,62 @@ is how a resolved incident becomes a fresh one.
 
 ---
 
+## Durable workflows
+
+```java
+Workflow onboarding = Workflow.named("place-order")
+        .step("reserve-stock",  ctx -> inventory.reserve(ctx.input()))
+        .step("charge-card",    ctx -> billing.charge(ctx.requireOutputOf("reserve-stock")))
+        .step("ship",           ctx -> shipping.dispatch(ctx.requireOutputOf("charge-card")))
+        .step("notify",         ctx -> mailer.confirm(ctx.input()))
+        .build();
+```
+
+```bash
+curl -X POST localhost:8080/api/workflows/place-order/runs -H 'content-type: application/json' -d '{"tenantId":"acme","input":{"orderId":42}}'
+```
+
+Each step's output is committed before the next begins. **If a worker dies at step three, another
+worker resumes at step three** — it does not re-reserve the stock or re-charge the card.
+
+A run is driven by exactly one ordinary job, so workflows inherit leasing, fencing, heartbeats,
+retries, the attempt budget and the dead-letter queue unchanged. There is no second execution
+machine to keep in sync with the first.
+
+### The ordering that is the whole guarantee
+
+Commit the step output, **then** advance the resume pointer. Never the reverse.
+
+A crash between the two re-runs the step. The opposite ordering would instead *skip* a step that
+never ran — and re-running an idempotent step is a problem the step handles, while silently
+skipping one is data loss nobody notices until an auditor asks.
+
+### When two workers run the same step
+
+The primary key on `(run_id, step_index)` decides it. Both `INSERT`, exactly one wins, and the
+loser **reads the winner's output back and continues from it**. Both executions then proceed from
+identical state, and the run has one authoritative history rather than one that depends on whoever
+finished last. `recordStep` returns the *stored* form for the same reason — jsonb normalises
+whitespace, so returning the raw input would hand a step's successors different bytes on a fresh
+run than on a resumed one.
+
+Progress is advanced with `GREATEST`, so a straggler finishing step two cannot rewind a run that
+already reached step four.
+
+### What this costs
+
+One worker is occupied for a whole run. That is right for workflows measured in seconds and wrong
+for one that waits three days on a human — those want a continuation model, where a waiting step
+re-enqueues the run with a delay and frees the worker. The schema already supports it
+(`completed_steps` is all a continuation needs); the executor does not do it yet, and claiming
+otherwise would be the wrong thing to say about a scheduler.
+
+Step indices are positional, so **reordering or deleting a step changes the meaning of every
+in-flight run**. Versioning means registering a new workflow type, not editing an existing one —
+the same constraint every durable execution engine has.
+
+---
+
 ## Cron
 
 ```bash
@@ -466,6 +522,8 @@ price of losing that distinction in the admin view. Worth doing behind a flag.
 | `TransactionalEnqueueIT` | The job commits with the business write or not at all: rollback leaves no phantom job, a lost connection loses both halves together, and the store never touches the caller's transaction. |
 | `OutboxRelayIT` | Recorded transactionally, drained at-least-once: rolled-back messages never publish, failures retry, exhausted ones dead-letter, a claimed message is invisible to a second relay, and an abandoned claim reappears once its timeout lapses. |
 | `AdminOperationsIT` | Replay and cancel refuse live jobs, `replay_count` survives, filters and paging behave. |
+| `WorkflowIT` | Steps run in order with outputs available; a retried run resumes at the failed step with completed steps executing exactly once; replay returns committed values, not recomputed ones; duplicate step commits converge; progress never rewinds. |
+| `WorkflowChaosIT` | A worker SIGKILLed mid-workflow: another finishes the run, the committed step runs once, the interrupted step runs twice. |
 | `CronExpressionTest` | Parsing, the day-of-month/day-of-week OR quirk, and DST in four zones: gaps, overlaps, the 24-fires-on-a-25-hour-day consequence, and monotonic fire times across transitions. No database. |
 | `CronSchedulerIT` | Firing, the three misfire policies, `catch_up_limit`, catch-up jobs keeping their occurrence time, invalid schedules self-disabling, and two tickers racing the same occurrence producing one job. |
 | `ChaosIT` | `terminateAbruptly()` models `kill -9` — the crashed worker writes *nothing* further. A killed worker's jobs finish elsewhere; a fleet losing a worker mid-flight loses no jobs; a stalled worker is fenced off and never writes a stale result. |
@@ -478,7 +536,8 @@ Milestone 1 is the durable dispatch core. Deliberately not here yet, roughly in 
 
 - **Leader election** via Postgres advisory lock, to stop every node ticking cron and reaping
   redundantly. Purely a load optimisation — correctness already holds without it.
-- **Durable workflows** — `workflow_runs` and `step_results`, resuming at the last completed step.
+- **Workflow continuations** — a step that must wait re-enqueues the run instead of holding a
+  worker, so a workflow can span days.
 - **Multi-tenant fairness** — weighted round-robin, per-queue and per-tenant concurrency caps.
 - **Distributed rate limiting** and concurrency gates.
 - **Async trace propagation** — W3C trace context serialized at enqueue, restored as a linked span
