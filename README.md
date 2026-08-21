@@ -199,6 +199,47 @@ integration test runs against a real Postgres 16 in Testcontainers.
 
 ---
 
+## Measured
+
+Run them yourself with `./mvnw verify -Pbenchmarks`. Excluded from CI on purpose — a number
+measured on a shared runner describes the runner's neighbours, not this engine.
+
+Hardware: Intel i5-8600K (6 cores), 16 GB RAM, Postgres 16 in Docker Desktop for Windows.
+
+| | |
+|---|---|
+| Throughput, saturated queue | **1,646 jobs/sec** |
+| Enqueue rate, single connection | 1,626 jobs/sec |
+| Scheduling jitter, unsaturated (p50 / p95 / p99) | **61 / 125 / 256 ms** |
+| Recovery after `kill -9`, 5s lease | **5.47s** to fully drain |
+| Jobs lost across all runs | **0** |
+| Jobs dead-lettered under fault injection | **0** |
+
+Read these honestly:
+
+**Throughput is engine overhead, not a workload prediction.** The handler is a no-op, so this
+measures claim + mark-running + complete and nothing else — about three round trips per job.
+Real jobs are dominated by their own I/O. It is also measured through Docker Desktop's network
+layer on Windows, which is materially slower than a native Linux socket; treat it as a floor.
+
+**Scheduling jitter is bounded below by the poll interval**, and that is the whole story: a
+polling dispatcher cannot react faster than it polls. The p99 of 256ms reflects adaptive backoff
+during idle stretches. Replacing polling with `LISTEN/NOTIFY` would remove that floor — a worker
+woken by the enqueue itself starts in single-digit milliseconds.
+
+**Recovery time is a restatement of the lease duration**, which is the point. A 5s lease recovers
+in ~5s. Shortening it recovers faster and tolerates less GC pause; lengthening it does the
+reverse. The engine does not remove that tradeoff — fencing just makes it *safe* to tune, because
+a short lease can no longer turn a slow worker into a double execution.
+
+### The obvious next optimization
+
+Every job costs a `markRunning` round trip purely to make "leased but not yet started" observable.
+Claiming straight into `RUNNING` would cut roughly a third of the per-job database cost, at the
+price of losing that distinction in the admin view. Worth doing behind a flag.
+
+---
+
 ## Test suite
 
 | Suite | What it pins down |

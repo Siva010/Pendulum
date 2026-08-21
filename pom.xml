@@ -78,6 +78,33 @@
     </dependencies>
   </dependencyManagement>
 
+  <profiles>
+    <!--
+      Benchmarks are excluded from `mvn verify` on purpose. They take minutes, and a number
+      measured on a shared CI runner describes the runner's neighbours rather than this engine —
+      publishing that would be worse than publishing nothing. Run them locally, on a quiet
+      machine, and record the hardware alongside the result:
+
+          ./mvnw verify -Pbenchmarks
+    -->
+    <profile>
+      <id>benchmarks</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <includes>
+                <include>**/*Benchmark.java</include>
+              </includes>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+
   <build>
     <plugins>
       <!-- Integration tests (*IT) run under failsafe, not surefire: they need Docker, they take
