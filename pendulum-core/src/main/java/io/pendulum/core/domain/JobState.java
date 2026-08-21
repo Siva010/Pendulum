@@ -32,6 +32,9 @@ public sealed interface JobState {
     /** Terminal failure: attempts exhausted, or a non-retryable error class. */
     record DeadLettered(String error, Instant at) implements JobState {}
 
+    /** Terminal by operator decision. Kept as a state rather than a deletion so the record survives. */
+    record Cancelled(String reason, Instant at) implements JobState {}
+
     /** The persisted discriminator for this state. */
     default String discriminator() {
         return switch (this) {
@@ -41,6 +44,7 @@ public sealed interface JobState {
             case Succeeded ignored    -> "SUCCEEDED";
             case Failed ignored       -> "FAILED";
             case DeadLettered ignored -> "DEAD_LETTERED";
+            case Cancelled ignored    -> "CANCELLED";
         };
     }
 
@@ -54,6 +58,24 @@ public sealed interface JobState {
             case Succeeded s    -> true;
             case Failed f       -> true;
             case DeadLettered d -> true;
+            case Cancelled c    -> true;
+        };
+    }
+
+    /**
+     * True for terminal states an operator may replay. Deliberately excludes the live states: a
+     * "replay" of a RUNNING job would not be a replay, it would be a second execution racing the
+     * first, which is the precise thing the rest of this engine exists to prevent.
+     */
+    default boolean isReplayable() {
+        return switch (this) {
+            case DeadLettered d -> true;
+            case Failed f       -> true;
+            case Cancelled c    -> true;
+            case Succeeded s    -> false;
+            case Pending p      -> false;
+            case Leased l       -> false;
+            case Running r      -> false;
         };
     }
 
@@ -66,6 +88,7 @@ public sealed interface JobState {
             case Succeeded s    -> Optional.empty();
             case Failed f       -> Optional.empty();
             case DeadLettered d -> Optional.empty();
+            case Cancelled c    -> Optional.empty();
         };
     }
 }

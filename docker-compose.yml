@@ -7,7 +7,10 @@ services:
       POSTGRES_USER: pendulum
       POSTGRES_PASSWORD: pendulum
     ports:
-      - "5432:5432"
+      # Published on 5433, not 5432: a locally installed Postgres very often already owns 5432,
+      # and the failure mode when it does is a container that will not start with an error that
+      # says nothing about the port.
+      - "5433:5432"
     command:
       - postgres
       # A jobs table is the highest-churn table in the schema. These raise the ceiling on

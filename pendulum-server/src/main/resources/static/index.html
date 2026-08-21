@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pendulum</title>
+<style>
+  /* No CDN, no build step, no framework. The console is an operational tool that has to work when
+     things are broken, and a dashboard that needs the network to render is a dashboard that fails
+     exactly when you need it. */
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e9ef; --muted: #8b93a3;
+    --accent: #6ea8fe; --ok: #4ec98a; --warn: #e6b955; --bad: #e8697d; --run: #b892f6;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#e2e5ea; --text:#1b1f27; --muted:#6b7280; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:20px 24px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:14px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:19px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; }
+  main { padding:20px 24px; max-width:1500px; }
+  .cards { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); margin-bottom:22px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card .n { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .card .l { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  input,select,button { font:inherit; background:var(--panel); color:var(--text);
+                        border:1px solid var(--line); border-radius:8px; padding:7px 11px; }
+  button { cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--accent); color:#0b1020; border-color:var(--accent); font-weight:600; }
+  button.danger  { border-color:var(--bad); color:var(--bad); }
+  .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+  table { border-collapse:collapse; width:100%; min-width:1000px; }
+  th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  tr:last-child td { border-bottom:none; }
+  .mono { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:12px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:600; }
+  .PENDING{background:#6ea8fe22;color:var(--accent)} .LEASED{background:#e6b95522;color:var(--warn)}
+  .RUNNING{background:#b892f622;color:var(--run)}   .SUCCEEDED{background:#4ec98a22;color:var(--ok)}
+  .DEAD_LETTERED{background:#e8697d22;color:var(--bad)} .FAILED{background:#e8697d22;color:var(--bad)}
+  .CANCELLED{background:#8b93a322;color:var(--muted)}
+  .err { color:var(--bad); max-width:420px; word-break:break-word; font-size:12px; }
+  .muted { color:var(--muted); }
+  .empty { padding:40px; text-align:center; color:var(--muted); }
+  #toast { position:fixed; right:20px; bottom:20px; background:var(--panel); border:1px solid var(--line);
+           border-left:3px solid var(--accent); border-radius:8px; padding:11px 15px; opacity:0;
+           transition:opacity .2s; pointer-events:none; max-width:380px; }
+  #toast.show { opacity:1; }
+  #toast.bad { border-left-color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pendulum</h1>
+  <span class="sub">durable job execution &middot; <span id="workers" class="mono">–</span></span>
+  <span class="sub" style="margin-left:auto">
+    auto-refresh <input type="checkbox" id="auto" checked> &middot;
+    <span id="clock" class="mono">–</span>
+  </span>
+</header>
+
+<main>
+  <div class="cards" id="cards"></div>
+
+  <div class="bar">
+    <select id="state">
+      <option value="">all states</option>
+      <option>PENDING</option><option>LEASED</option><option>RUNNING</option>
+      <option>SUCCEEDED</option><option>DEAD_LETTERED</option><option>CANCELLED</option>
+    </select>
+    <input id="tenant" placeholder="tenant" size="10">
+    <input id="queue" placeholder="queue" size="10">
+    <input id="jobType" placeholder="job type" size="14">
+    <button onclick="load()">Filter</button>
+    <span style="flex:1"></span>
+    <button class="danger" id="replayAll" onclick="replayDlq()">Replay all dead letters</button>
+    <button class="primary" onclick="seed()">Enqueue demo jobs</button>
+  </div>
+
+  <div class="wrap">
+    <table>
+      <thead><tr>
+        <th>id</th><th>type</th><th>queue</th><th>state</th><th>attempt</th>
+        <th>run at</th><th>owner</th><th>last error</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No jobs match this filter.</div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = (path, opts) => fetch('/api' + path, opts).then(async r => {
+  const body = r.status === 204 ? null : await r.json().catch(() => null);
+  if (!r.ok) throw new Error(body?.error || `${r.status} ${r.statusText}`);
+  return body;
+});
+
+function toast(message, bad) {
+  const el = $('toast');
+  el.textContent = message;
+  el.className = 'show' + (bad ? ' bad' : '');
+  setTimeout(() => el.className = '', 3200);
+}
+
+const shortId = id => id.slice(0, 8);
+const time = value => value ? new Date(value).toLocaleTimeString() : '–';
+
+function filters() {
+  const params = new URLSearchParams();
+  for (const key of ['state', 'tenant', 'queue', 'jobType']) {
+    const value = $(key).value.trim();
+    if (value) params.set(key === 'tenant' ? 'tenantId' : key, value);
+  }
+  return params;
+}
+
+async function load() {
+  try {
+    const params = filters();
+    params.set('limit', '100');
+    const [listing, depth, workers, outbox] = await Promise.all([
+      api('/jobs?' + params),
+      api('/queues/default/depth'),
+      api('/workers'),
+      api('/outbox/stats')
+    ]);
+
+    const states = ['PENDING','LEASED','RUNNING','SUCCEEDED','DEAD_LETTERED','CANCELLED'];
+    $('cards').innerHTML = states.map(s =>
+      `<div class="card"><div class="n">${depth[s] ?? 0}</div><div class="l">${s.replace('_',' ').toLowerCase()}</div></div>`
+    ).join('') +
+      `<div class="card"><div class="n">${outbox.pending}</div><div class="l">outbox pending</div></div>`;
+
+    const inFlight = workers.reduce((sum, w) => sum + w.inFlight, 0);
+    $('workers').textContent = `${workers.length} worker(s), ${inFlight} in flight`;
+
+    const jobs = listing.jobs;
+    $('empty').hidden = jobs.length > 0;
+    $('rows').innerHTML = jobs.map(job => `
+      <tr>
+        <td class="mono" title="${job.id}">${shortId(job.id)}</td>
+        <td>${job.jobType}</td>
+        <td class="muted">${job.queue}</td>
+        <td><span class="pill ${job.state}">${job.state}</span></td>
+        <td class="mono">${job.attempt}/${job.maxAttempts}${job.replayCount ? ` <span class="muted" title="replays">↻${job.replayCount}</span>` : ''}</td>
+        <td class="mono muted">${time(job.runAt)}</td>
+        <td class="mono muted">${job.leaseOwner ? job.leaseOwner.split('/').pop() : '–'}</td>
+        <td class="err">${job.lastError ? job.lastError.replace(/</g,'&lt;').slice(0,160) : ''}</td>
+        <td>
+          ${['DEAD_LETTERED','CANCELLED','FAILED'].includes(job.state)
+            ? `<button onclick="act('${job.id}','replay')">Replay</button>` : ''}
+          ${job.state === 'PENDING'
+            ? `<button onclick="act('${job.id}','cancel')">Cancel</button>` : ''}
+        </td>
+      </tr>`).join('');
+
+    $('replayAll').disabled = (depth.DEAD_LETTERED ?? 0) === 0;
+    $('clock').textContent = new Date().toLocaleTimeString();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function act(id, what) {
+  try {
+    await api(`/jobs/${id}/${what}`, { method: 'POST' });
+    toast(`${what === 'replay' ? 'Replayed' : 'Cancelled'} ${shortId(id)}`);
+    load();
+  } catch (e) {
+    // The 409 path: the job moved on between the page rendering and the click landing.
+    toast(e.message, true);
+    load();
+  }
+}
+
+async function replayDlq() {
+  try {
+    const result = await api('/dlq/replay?limit=100', { method: 'POST' });
+    toast(`Replayed ${result.replayed} of ${result.candidates}; ${result.remaining} left`);
+    load();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function seed() {
+  const demo = [
+    { jobType: 'noop',   count: 6 },
+    { jobType: 'sleep',  count: 2 },
+    { jobType: 'boom',   count: 2 },   // retries, then dead-letters
+    { jobType: 'poison', count: 2 }    // terminal on the first attempt
+  ];
+  try {
+    for (const { jobType, count } of demo) {
+      for (let i = 0; i < count; i++) {
+        await api('/jobs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ tenantId: 'demo', jobType, payload: { n: i } })
+        });
+      }
+    }
+    toast('Enqueued 12 demo jobs');
+    load();
+  } catch (e) { toast(e.message, true); }
+}
+
+load();
+setInterval(() => { if ($('auto').checked) load(); }, 2000);
+</script>
+</body>
+</html>

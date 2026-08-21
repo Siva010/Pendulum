@@ -91,6 +91,30 @@ public interface JobStore {
 
     Optional<Job> find(UUID id);
 
+    /** Filtered, paged listing for the admin surface. */
+    List<Job> findJobs(JobQuery query);
+
+    long countJobs(JobQuery query);
+
+    /**
+     * Send a terminal job back to the queue with a fresh attempt budget.
+     *
+     * <p>Only legal from a terminal state — see {@code JobState#isReplayable()}. Replaying a LEASED
+     * or RUNNING job would not be a replay, it would be a second execution racing the first, and no
+     * amount of fencing helps when the operator is the one creating the duplicate.
+     */
+    boolean replay(UUID id);
+
+    /**
+     * Cancel a job that has not started.
+     *
+     * <p>Only legal from PENDING. Once a worker holds the lease the handler may already have caused
+     * effects, and a store that flipped the row to CANCELLED underneath it would be lying to the
+     * operator about what happened. Stopping in-flight work needs cooperative cancellation through
+     * {@code JobContext}, which is a different feature.
+     */
+    boolean cancel(UUID id, String reason);
+
     /** Job counts by state for one queue — the signal KEDA should autoscale on. */
     Map<String, Long> queueDepth(String queue);
 

@@ -45,6 +45,10 @@ replays stay bounded by what the dying worker had in flight.
 docker compose up -d
 ```
 
+Postgres is published on **5433**, not 5432 — a locally installed Postgres usually owns 5432
+already, and the failure when it does is a container that refuses to start with an error that
+never mentions the port.
+
 ```bash
 ./mvnw verify
 ```
@@ -56,8 +60,19 @@ takes a few minutes, mostly spent deliberately waiting out lease expiry.
 Run the server:
 
 ```bash
-./mvnw -pl pendulum-server spring-boot:run
+./mvnw package -DskipTests
 ```
+
+```bash
+java -jar pendulum-server/target/pendulum-server-0.1.0-SNAPSHOT.jar
+```
+
+(`./mvnw -pl pendulum-server spring-boot:run` does **not** work here — the goal prefix resolves
+against the parent aggregator, which does not declare the plugin. Use
+`./mvnw -pl pendulum-server org.springframework.boot:spring-boot-maven-plugin:run` if you want
+live reload.)
+
+Then open <http://localhost:8080> for the admin console.
 
 ```bash
 curl -X POST localhost:8080/api/jobs -H 'content-type: application/json' -d '{"tenantId":"acme","jobType":"noop","payload":{"hello":"world"}}'
@@ -199,6 +214,68 @@ integration test runs against a real Postgres 16 in Testcontainers.
 
 ---
 
+## Operating it
+
+An admin console is served at `http://localhost:8080` once the server is running. One static HTML
+file, no CDN, no build step — a dashboard that needs the network to render is a dashboard that
+fails exactly when you need it.
+
+It shows queue depth by state, live worker occupancy, the dead-letter queue with its failure
+chains, and buttons to replay or cancel. **Enqueue demo jobs** seeds a mix of handlers, two of
+which fail on purpose: `boom` retries and eventually dead-letters, `poison` is terminal on the
+first attempt. Watching those two land in the DLQ and then replaying them is the fastest way to see
+the whole state machine move.
+
+
+### The 60-second demo
+
+Click **Enqueue demo jobs** and watch the table. Within a few seconds you get the entire state
+machine on one screen:
+
+| Handler | Ends as | Attempts | Why |
+|---|---|---|---|
+| `noop` | SUCCEEDED | 1/5 | clean first pass |
+| `sleep` | SUCCEEDED | 1/5 | 10s handler, kept alive by heartbeats across several beats |
+| `boom` | DEAD_LETTERED | **5/5** | transient failure, retried through the whole budget with jittered backoff |
+| `poison` | DEAD_LETTERED | **1/5** | terminal error — retries skipped entirely |
+
+The 5/5 against 1/5 is the interesting column. Both jobs failed every time they ran; only one of
+them was worth retrying, and the engine knew the difference without being told per-job.
+
+Then hit **Replay all dead letters** and watch them go round again, with `↻` recording that they
+were replayed.
+
+```
+GET  /api/jobs?state=DEAD_LETTERED&tenantId=acme&limit=50&offset=0
+POST /api/jobs/{id}/replay
+POST /api/jobs/{id}/cancel?reason=...
+POST /api/dlq/replay?limit=100
+GET  /api/queues/{queue}/depth
+GET  /api/outbox/stats
+```
+
+### The guards on those buttons
+
+**Replay only works from a terminal state.** Replaying a `RUNNING` job would not be a replay — it
+would be a second execution racing the first, created by the operator trying to fix things.
+Fencing cannot save you here, because both executions hold legitimate leases. The store refuses,
+and the API answers `409` rather than `400`: the request is well formed, it just conflicts with
+where the job now is. An operator who clicks replay on a job a worker picked up half a second ago
+should be told exactly that.
+
+**Cancel only works from `PENDING`.** Once a worker holds the lease the handler may already have
+charged the card, and flipping the row to `CANCELLED` underneath it would be lying about what
+happened. Stopping live work needs cooperative cancellation via `JobContext.checkLease()`.
+
+**Replay resets the attempt budget but not `replay_count`.** Otherwise a job sent round three times
+looks like a job that has failed once, and the operator loses the clearest signal that something is
+systematically broken rather than transiently unlucky.
+
+**Bulk DLQ replay is capped at a page.** Replaying two hundred thousand dead letters in one click
+is how a resolved incident becomes a fresh one.
+
+---
+
 ## Transactional enqueue, and when you need an outbox
 
 The bug this removes:
@@ -316,6 +393,9 @@ price of losing that distinction in the admin view. Worth doing behind a flag.
 | `LeaseDispatchIT` | Eligibility, priority ordering, queue isolation, monotonic tokens, per-tenant idempotent enqueue, and 8 workers draining 600 jobs with zero overlap. |
 | `FencingIT` | The lease race: stale completions and stale failures rejected, heartbeat renewal, orphan requeue, dead-lettering exhausted orphans, attempt refund on graceful release. |
 | `WorkerExecutionIT` | End to end. Exactly-once under normal operation, retry vs. dead-letter classification, unknown job types retried rather than written off, delayed jobs held back, drain on shutdown. |
+| `TransactionalEnqueueIT` | The job commits with the business write or not at all: rollback leaves no phantom job, a lost connection loses both halves together, and the store never touches the caller's transaction. |
+| `OutboxRelayIT` | Recorded transactionally, drained at-least-once: rolled-back messages never publish, failures retry, exhausted ones dead-letter, a claimed message is invisible to a second relay, and an abandoned claim reappears once its timeout lapses. |
+| `AdminOperationsIT` | Replay and cancel refuse live jobs, `replay_count` survives, filters and paging behave. |
 | `ChaosIT` | `terminateAbruptly()` models `kill -9` — the crashed worker writes *nothing* further. A killed worker's jobs finish elsewhere; a fleet losing a worker mid-flight loses no jobs; a stalled worker is fenced off and never writes a stale result. |
 
 ---
@@ -324,10 +404,6 @@ price of losing that distinction in the admin view. Worth doing behind a flag.
 
 Milestone 1 is the durable dispatch core. Deliberately not here yet, roughly in build order:
 
-- **Transactional outbox** — enqueue in the same transaction as the business write. The single
-  most commercially valuable feature in the design.
-- **Dead-letter inspection and replay** — the `DEAD_LETTERED` state exists; the operator surface
-  does not.
 - **Cron scheduling** — timezone-aware, DST-correct, with catch-up and misfire policies.
 - **Leader election** via Postgres advisory lock, so cron ticking and reaping are singleton
   responsibilities with correct handling of lease loss.

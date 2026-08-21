@@ -121,6 +121,24 @@
       <plugins>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.13.0</version>
+          <configuration>
+            <!--
+              Retain parameter names in the class files. Spring MVC needs them to bind
+              @PathVariable and @RequestParam without an explicit name, and without this every
+              such endpoint fails at request time — not at startup — with "parameter name
+              information not available via reflection".
+
+              spring-boot-starter-parent sets this for you. This project imports the Spring BOM
+              instead of inheriting that parent, deliberately, so that pendulum-core owes nothing
+              to Spring's build conventions. The flag is part of the price of that choice.
+            -->
+            <parameters>true</parameters>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>${surefire.version}</version>
         </plugin>

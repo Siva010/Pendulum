@@ -3,7 +3,7 @@ spring:
     name: pendulum
 
   datasource:
-    url: ${PENDULUM_DB_URL:jdbc:postgresql://localhost:5432/pendulum}
+    url: ${PENDULUM_DB_URL:jdbc:postgresql://localhost:5433/pendulum}
     username: ${PENDULUM_DB_USER:pendulum}
     password: ${PENDULUM_DB_PASSWORD:pendulum}
     hikari:

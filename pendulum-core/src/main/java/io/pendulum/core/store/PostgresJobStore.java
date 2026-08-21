@@ -40,13 +40,14 @@ public final class PostgresJobStore implements JobStore {
     private static final String JOB_COLUMNS = """
             id, tenant_id, queue, job_type, payload::text AS payload, state, priority, run_at,
             attempt, max_attempts, lease_token, lease_owner, lease_expires_at,
-            idempotency_key, last_error, created_at, updated_at
+            idempotency_key, last_error, replay_count, created_at, updated_at
             """;
 
     private static final String RETURNING_JOB = """
             RETURNING j.id, j.tenant_id, j.queue, j.job_type, j.payload::text AS payload, j.state,
                       j.priority, j.run_at, j.attempt, j.max_attempts, j.lease_token, j.lease_owner,
-                      j.lease_expires_at, j.idempotency_key, j.last_error, j.created_at, j.updated_at
+                      j.lease_expires_at, j.idempotency_key, j.last_error, j.replay_count,
+                      j.created_at, j.updated_at
             """;
 
     /**
@@ -353,6 +354,102 @@ public final class PostgresJobStore implements JobStore {
         }
     }
 
+    /**
+     * Replay resets the attempt budget but not {@code replay_count}, so an operator can still see
+     * that a job has been sent round three times rather than a row that looks freshly failed.
+     */
+    private static final String REPLAY_SQL = """
+            UPDATE jobs
+               SET state            = 'PENDING',
+                   run_at           = now(),
+                   attempt          = 0,
+                   completed_at     = NULL,
+                   lease_expires_at = NULL,
+                   lease_owner      = NULL,
+                   replay_count     = replay_count + 1,
+                   last_replayed_at = now(),
+                   updated_at       = now()
+             WHERE id = ? AND state IN ('DEAD_LETTERED', 'FAILED', 'CANCELLED')
+            """;
+
+    private static final String CANCEL_SQL = """
+            UPDATE jobs
+               SET state        = 'CANCELLED',
+                   last_error   = ?,
+                   completed_at = now(),
+                   updated_at   = now()
+             WHERE id = ? AND state = 'PENDING'
+            """;
+
+    @Override
+    public List<Job> findJobs(JobQuery query) {
+        StringBuilder sql = new StringBuilder("SELECT ").append(JOB_COLUMNS).append(" FROM jobs WHERE 1=1");
+        List<Object> parameters = new ArrayList<>();
+        appendFilters(query, sql, parameters);
+        sql.append(" ORDER BY created_at DESC, id LIMIT ? OFFSET ?");
+        parameters.add(query.limit());
+        parameters.add(query.offset());
+
+        try (Connection connection = dataSource.getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            bind(statement, parameters);
+            List<Job> jobs = new ArrayList<>();
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    jobs.add(mapJob(rs));
+                }
+            }
+            return jobs;
+        } catch (SQLException e) {
+            throw new JobStoreException("failed to list jobs", e);
+        }
+    }
+
+    @Override
+    public long countJobs(JobQuery query) {
+        StringBuilder sql = new StringBuilder("SELECT count(*) FROM jobs WHERE 1=1");
+        List<Object> parameters = new ArrayList<>();
+        appendFilters(query, sql, parameters);
+
+        try (Connection connection = dataSource.getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            bind(statement, parameters);
+            try (ResultSet rs = statement.executeQuery()) {
+                rs.next();
+                return rs.getLong(1);
+            }
+        } catch (SQLException e) {
+            throw new JobStoreException("failed to count jobs", e);
+        }
+    }
+
+    /** Filters are appended as placeholders only; no caller-supplied text ever reaches the SQL. */
+    private static void appendFilters(JobQuery query, StringBuilder sql, List<Object> parameters) {
+        if (query.tenantId() != null) { sql.append(" AND tenant_id = ?"); parameters.add(query.tenantId()); }
+        if (query.queue() != null)    { sql.append(" AND queue = ?");     parameters.add(query.queue()); }
+        if (query.state() != null)    { sql.append(" AND state = ?");     parameters.add(query.state()); }
+        if (query.jobType() != null)  { sql.append(" AND job_type = ?");  parameters.add(query.jobType()); }
+    }
+
+    private static void bind(PreparedStatement statement, List<Object> parameters) throws SQLException {
+        for (int i = 0; i < parameters.size(); i++) {
+            statement.setObject(i + 1, parameters.get(i));
+        }
+    }
+
+    @Override
+    public boolean replay(UUID id) {
+        return fencedUpdate(REPLAY_SQL, "replay", statement -> statement.setObject(1, id));
+    }
+
+    @Override
+    public boolean cancel(UUID id, String reason) {
+        return fencedUpdate(CANCEL_SQL, "cancel", statement -> {
+            statement.setString(1, truncate(reason == null ? "cancelled by operator" : reason));
+            statement.setObject(2, id);
+        });
+    }
+
     @Override
     public Map<String, Long> queueDepth(String queue) {
         try (Connection connection = dataSource.getConnection();
@@ -413,6 +510,7 @@ public final class PostgresJobStore implements JobStore {
             case "SUCCEEDED"     -> new JobState.Succeeded(updatedAt);
             case "FAILED"        -> new JobState.Failed(lastError);
             case "DEAD_LETTERED" -> new JobState.DeadLettered(lastError, updatedAt);
+            case "CANCELLED"     -> new JobState.Cancelled(lastError, updatedAt);
             default -> throw new JobStoreException("unknown job state '" + discriminator + "'", null);
         };
 
@@ -429,6 +527,7 @@ public final class PostgresJobStore implements JobStore {
                 rs.getInt("max_attempts"),
                 rs.getString("idempotency_key"),
                 lastError,
+                rs.getInt("replay_count"),
                 instant(rs, "created_at"),
                 updatedAt);
     }

@@ -26,6 +26,7 @@ public record Job(
         int maxAttempts,
         String idempotencyKey,
         String lastError,
+        int replayCount,
         Instant createdAt,
         Instant updatedAt
 ) {

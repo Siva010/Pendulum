@@ -144,6 +144,6 @@ class RetryPolicyTest {
         return new Job(UUID.randomUUID(), "tenant-a", "default", "test", "{}",
                 new JobState.Running(new io.pendulum.core.domain.LeaseToken(1), "worker-a",
                         Instant.now().plusSeconds(30)),
-                0, Instant.now(), attempt, maxAttempts, null, null, Instant.now(), Instant.now());
+                0, Instant.now(), attempt, maxAttempts, null, null, 0, Instant.now(), Instant.now());
     }
 }
