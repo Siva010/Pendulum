@@ -1,0 +1,9 @@
+# The Maven wrapper is a shell script executed by the Linux CI runner. If it is ever checked
+# out with CRLF endings, bash fails with a cryptic "bad interpreter" error, so pin it to LF
+# regardless of the platform it was committed from.
+* text=auto
+mvnw       text eol=lf
+*.sh       text eol=lf
+mvnw.cmd   text eol=crlf
+*.bat      text eol=crlf
+*.jar      binary

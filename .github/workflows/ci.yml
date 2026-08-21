@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # A newer push makes an in-flight run for the same branch pointless. The exception is main,
+  # where every commit's result is worth keeping.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    # The chaos suite deliberately waits out lease expiry, so it is slow by design rather than
+    # by accident. Generous, but bounded so a hung worker cannot burn an hour of runner time.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Unit tests
+        # Run these first and separately. They need no Docker and finish in seconds, so a broken
+        # backoff curve fails the build in under a minute instead of after the container suite.
+        run: ./mvnw -B -ntp test
+
+      - name: Integration and chaos suites
+        # Testcontainers provisions Postgres 16 against the runner's Docker daemon. No service
+        # container is declared on purpose: the suite owns its database lifecycle, which is what
+        # makes the same command work identically on a laptop.
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+          retention-days: 14
+          if-no-files-found: ignore

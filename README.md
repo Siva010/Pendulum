@@ -1,5 +1,9 @@
 # Pendulum
 
+[![CI](https://github.com/Siva010/Pendulum/actions/workflows/ci.yml/badge.svg)](https://github.com/Siva010/Pendulum/actions/workflows/ci.yml)
+[![Java 21](https://img.shields.io/badge/Java-21-orange)](https://openjdk.org/projects/jdk/21/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A durable job execution engine in Java 21, built on Postgres.
 
 Workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`, hold them on heartbeat-renewed
