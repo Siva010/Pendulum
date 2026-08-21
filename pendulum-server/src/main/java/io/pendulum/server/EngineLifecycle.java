@@ -1,5 +1,6 @@
 package io.pendulum.server;
 
+import io.pendulum.core.cron.CronScheduler;
 import io.pendulum.core.engine.LeaseReaper;
 import io.pendulum.core.outbox.OutboxRelay;
 import org.slf4j.Logger;
@@ -26,18 +27,22 @@ public class EngineLifecycle implements SmartLifecycle {
     private final WorkerPool pool;
     private final LeaseReaper reaper;
     private final OutboxRelay outboxRelay;
+    private final CronScheduler cronScheduler;
     private volatile boolean running;
 
-    public EngineLifecycle(WorkerPool pool, LeaseReaper reaper, OutboxRelay outboxRelay) {
+    public EngineLifecycle(WorkerPool pool, LeaseReaper reaper,
+                           OutboxRelay outboxRelay, CronScheduler cronScheduler) {
         this.pool = pool;
         this.reaper = reaper;
         this.outboxRelay = outboxRelay;
+        this.cronScheduler = cronScheduler;
     }
 
     @Override
     public void start() {
         reaper.start();
         outboxRelay.start();
+        cronScheduler.start();
         pool.start();
         running = true;
         log.info("Pendulum engine started with {} worker(s)", pool.size());
@@ -51,6 +56,7 @@ public class EngineLifecycle implements SmartLifecycle {
         running = false;
         log.info("draining Pendulum engine");
         pool.close();
+        cronScheduler.close();
         outboxRelay.close();
         reaper.close();
         log.info("Pendulum engine stopped: {}", pool.aggregateMetrics());

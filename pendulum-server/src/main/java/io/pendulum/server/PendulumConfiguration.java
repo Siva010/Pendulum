@@ -1,5 +1,8 @@
 package io.pendulum.server;
 
+import io.pendulum.core.cron.CronScheduleStore;
+import io.pendulum.core.cron.CronScheduler;
+import io.pendulum.core.cron.PostgresCronScheduleStore;
 import io.pendulum.core.engine.HandlerRegistry;
 import io.pendulum.core.outbox.OutboxPublisher;
 import io.pendulum.core.outbox.OutboxRelay;
@@ -95,6 +98,20 @@ public class PendulumConfiguration {
     @Bean
     public LeaseReaper leaseReaper(JobStore store, PendulumProperties properties) {
         return new LeaseReaper(store, properties.reapInterval(), properties.reapBatchSize());
+    }
+
+    @Bean
+    public CronScheduleStore cronScheduleStore(DataSource dataSource) {
+        return new PostgresCronScheduleStore(dataSource);
+    }
+
+    /**
+     * Safe to run on every node. Occurrences carry a deterministic idempotency key, so concurrent
+     * tickers cannot double-fire — leadership would reduce redundant work, not prevent a bug.
+     */
+    @Bean
+    public CronScheduler cronScheduler(CronScheduleStore cronScheduleStore, JobStore store) {
+        return CronScheduler.defaults(cronScheduleStore, store);
     }
 
     @Bean

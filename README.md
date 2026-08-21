@@ -276,6 +276,76 @@ is how a resolved incident becomes a fresh one.
 
 ---
 
+## Cron
+
+```bash
+curl -X POST localhost:8080/api/cron -H 'content-type: application/json' -d '{"tenantId":"acme","name":"nightly-report","cron":"30 2 * * *","timezone":"Europe/London","jobType":"report","misfirePolicy":"FIRE_ONCE"}'
+```
+
+```bash
+curl "localhost:8080/api/cron/preview?cron=30+2+*+*+*&timezone=Europe/London&count=5"
+```
+
+Five-field expressions with ranges, steps, lists, three-letter names and the usual macros. The
+parser is hand-written — `pendulum-core` has no dependency on a cron library, and the interesting
+part was never the parsing.
+
+**The scheduler fires nothing itself.** Each occurrence becomes an ordinary row in `jobs`, so
+scheduled work inherits leasing, fencing, retries, the attempt budget and the DLQ unchanged. A
+scheduler that executed work directly would have to reimplement all of it.
+
+### Why it needs no leader to be correct
+
+Every occurrence carries a deterministic idempotency key — `cron:<schedule-id>:<fire-instant>` —
+so two tickers computing the same occurrence produce the same key and the existing unique index on
+`(tenant_id, idempotency_key)` rejects the second insert. A ticker that fires and then dies before
+recording progress re-fires the same occurrence on recovery, and the database absorbs it.
+
+Leader election here is a **load optimisation, not a safety mechanism**, and the distinction is
+worth insisting on: a correctness mechanism that depends on an election is a correctness mechanism
+that fails during one.
+
+### DST, which is the whole point
+
+Times are computed in the schedule's IANA zone, over **local wall-clock time**. Zone ids only —
+never fixed offsets, which silently mean the wrong wall-clock time for half the year.
+
+| Case | Behaviour |
+|---|---|
+| **Spring forward** — 01:30 never happens | Fires anyway, shifted past the gap. A missed nightly reconciliation is worse than a late one. |
+| **Fall back** — 01:30 happens twice | Fires **once**. Firing twice would double-charge, double-email, double-post. |
+| **Hourly on fall-back day** | Fires **24 times, not 25** — the repeated hour is one wall-clock label. |
+
+That last row is the cost of the second, and both are asserted in `CronExpressionTest`. One
+iteration strategy cannot give you "daily at 01:30 fires once" *and* "hourly fires 25 times on a
+25-hour day"; iterating instants would buy the second by double-firing every daily schedule, which
+is much worse. Vixie cron and Quartz make the same trade. Workloads that genuinely need elapsed
+time want a fixed interval, not a cron expression.
+
+Also preserved deliberately: when day-of-month **and** day-of-week are both restricted, cron matches
+*either*. `0 0 13 * FRI` is "the 13th, plus every Friday" — not "Friday the 13th". It reads like a
+bug and is the behaviour of every Unix cron since Vixie's.
+
+### Misfire policy
+
+What to do about occurrences that elapsed while nothing was ticking — a deploy, an outage. There is
+no universally right answer, which is why it is per-schedule:
+
+| Policy | Use when |
+|---|---|
+| `SKIP` | The job recomputes current state. A cache refresh missed at 02:00 is worthless at 09:00. |
+| `FIRE_ONCE` | Default. A nightly report that did not run should run — once, not the four times it owes. |
+| `FIRE_ALL` | Each occurrence does distinct work — per-hour billing rollups, where a skipped hour is lost data. |
+
+`FIRE_ALL` is bounded by `catch_up_limit` (default 100). Without a ceiling, a minutely schedule
+down for a week wakes up and enqueues 10,080 jobs in one tick, turning a recovered outage into a
+fresh one.
+
+Catch-up jobs carry the **occurrence's own** `run_at`, not the moment the catch-up ran — a handler
+that reads `run_at` to decide which window to process must see the window it is meant to process.
+
+---
+
 ## Transactional enqueue, and when you need an outbox
 
 The bug this removes:
@@ -396,6 +466,8 @@ price of losing that distinction in the admin view. Worth doing behind a flag.
 | `TransactionalEnqueueIT` | The job commits with the business write or not at all: rollback leaves no phantom job, a lost connection loses both halves together, and the store never touches the caller's transaction. |
 | `OutboxRelayIT` | Recorded transactionally, drained at-least-once: rolled-back messages never publish, failures retry, exhausted ones dead-letter, a claimed message is invisible to a second relay, and an abandoned claim reappears once its timeout lapses. |
 | `AdminOperationsIT` | Replay and cancel refuse live jobs, `replay_count` survives, filters and paging behave. |
+| `CronExpressionTest` | Parsing, the day-of-month/day-of-week OR quirk, and DST in four zones: gaps, overlaps, the 24-fires-on-a-25-hour-day consequence, and monotonic fire times across transitions. No database. |
+| `CronSchedulerIT` | Firing, the three misfire policies, `catch_up_limit`, catch-up jobs keeping their occurrence time, invalid schedules self-disabling, and two tickers racing the same occurrence producing one job. |
 | `ChaosIT` | `terminateAbruptly()` models `kill -9` — the crashed worker writes *nothing* further. A killed worker's jobs finish elsewhere; a fleet losing a worker mid-flight loses no jobs; a stalled worker is fenced off and never writes a stale result. |
 
 ---
@@ -404,9 +476,8 @@ price of losing that distinction in the admin view. Worth doing behind a flag.
 
 Milestone 1 is the durable dispatch core. Deliberately not here yet, roughly in build order:
 
-- **Cron scheduling** — timezone-aware, DST-correct, with catch-up and misfire policies.
-- **Leader election** via Postgres advisory lock, so cron ticking and reaping are singleton
-  responsibilities with correct handling of lease loss.
+- **Leader election** via Postgres advisory lock, to stop every node ticking cron and reaping
+  redundantly. Purely a load optimisation — correctness already holds without it.
 - **Durable workflows** — `workflow_runs` and `step_results`, resuming at the last completed step.
 - **Multi-tenant fairness** — weighted round-robin, per-queue and per-tenant concurrency caps.
 - **Distributed rate limiting** and concurrency gates.
